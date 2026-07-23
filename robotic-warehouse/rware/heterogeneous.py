@@ -300,6 +300,40 @@ class HeterogeneousWarehouse(gym.Env):
         ]
         return self._observations(), self._get_info(events=[])
 
+    def get_observations(self) -> Tuple[np.ndarray, ...]:
+        """Return current AGV observations without advancing the environment."""
+
+        return self._observations()
+
+    def get_action_mask(self) -> np.ndarray:
+        """Return a safety-derived legal-action mask for every AGV.
+
+        The mask is an advisory interface for policy networks. ``step`` keeps
+        enforcing the same physical rules, so a stale planner decision can
+        never bypass collision, picker, charging, or death constraints.
+        """
+
+        mask = np.zeros((self.n_agents, len(HeterogeneousAction)), dtype=bool)
+        occupied = {(agv.x, agv.y) for agv in self.agents}
+        static_blockers = {(picker.x, picker.y) for picker in self.picking_robots}
+        for index, agv in enumerate(self.agents):
+            mask[index, HeterogeneousAction.NOOP.value] = True
+            if agv.dead or agv.locked:
+                continue
+            mask[index, HeterogeneousAction.LEFT.value] = True
+            mask[index, HeterogeneousAction.RIGHT.value] = True
+            mask[index, HeterogeneousAction.FORWARD.value] = self._can_enter(
+                agv, self._forward_location(agv), occupied, static_blockers
+            )
+            mask[index, HeterogeneousAction.TOGGLE_LOAD.value] = self._can_toggle_load(
+                agv
+            )
+            mask[index, HeterogeneousAction.CHARGE.value] = (
+                agv.x,
+                agv.y,
+            ) in self.charging_stations
+        return mask
+
     def step(self, actions: Sequence[int]):
         if len(actions) != self.n_agents:
             raise ValueError(f"expected {self.n_agents} actions, received {len(actions)}")
@@ -426,22 +460,29 @@ class HeterogeneousWarehouse(gym.Env):
         return None
 
     def _toggle_load(self, agv: AGV) -> bool:
+        if not self._can_toggle_load(agv):
+            return False
         if agv.carrying_shelf is None:
             shelf = self._shelf_at((agv.x, agv.y))
-            if shelf is None:
-                return False
             agv.carrying_shelf = shelf
             return True
+        agv.carrying_shelf.x, agv.carrying_shelf.y = agv.x, agv.y
+        agv.carrying_shelf = None
+        return True
 
+    def _can_toggle_load(self, agv: AGV) -> bool:
+        if agv.carrying_shelf is None:
+            return self._shelf_at((agv.x, agv.y)) is not None
         if (agv.x, agv.y) in self.picking_docks:
             return False
         if (agv.x, agv.y) in self.charging_stations:
             return False
-        if self._shelf_at((agv.x, agv.y)) is not None:
-            return False
-        agv.carrying_shelf.x, agv.carrying_shelf.y = agv.x, agv.y
-        agv.carrying_shelf = None
-        return True
+        return not any(
+            shelf.active
+            and shelf is not agv.carrying_shelf
+            and (shelf.x, shelf.y) == (agv.x, agv.y)
+            for shelf in self.shelfs
+        )
 
     def _start_available_picking(self, events: List[Dict[str, object]]) -> None:
         occupied_stations = {
