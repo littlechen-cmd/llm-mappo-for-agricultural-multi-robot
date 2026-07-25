@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 
 from rware.heterogeneous import HeterogeneousWarehouse
 from rware_llm.mappo import MAPPOConfig, MAPPOExecutor
@@ -64,3 +65,16 @@ def test_shared_actor_act_and_ppo_update_complete_on_cpu():
     metrics = executor.update(rollout, state.global_map, done)
     assert set(metrics) == {"actor_loss", "critic_loss", "entropy", "prior_loss"}
     assert all(np.isfinite(value) for value in metrics.values())
+
+
+def test_prior_mixing_is_a_true_probability_mixture():
+    _, _, _, _, _, executor = _make_components()
+    executor.set_prior_strength(0.8, 0.0)
+    actor_logits = torch.tensor([[0.0, 30.0, -30.0, -30.0, -30.0, -30.0]])
+    prior_probs = torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+
+    behavior_probs = executor._behavior_probs(actor_logits, prior_probs)
+
+    assert torch.isclose(behavior_probs.sum(), torch.tensor(1.0))
+    assert behavior_probs[0, 0] >= 0.8
+    assert torch.argmax(behavior_probs, dim=-1).item() == 0

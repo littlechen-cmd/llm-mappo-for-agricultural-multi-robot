@@ -170,6 +170,7 @@ class HeterogeneousWarehouse(gym.Env):
         max_steps: Optional[int] = 200,
         max_completed_tasks: Optional[int] = None,
         terminate_on_death: bool = False,
+        allow_manual_unload: bool = False,
         move_drain: float = 0.01,
         loaded_move_drain: float = 0.02,
         standby_drain: float = 0.002,
@@ -205,6 +206,7 @@ class HeterogeneousWarehouse(gym.Env):
         self.max_steps = max_steps
         self.max_completed_tasks = max_completed_tasks
         self.terminate_on_death = terminate_on_death
+        self.allow_manual_unload = allow_manual_unload
         self.move_drain = move_drain
         self.loaded_move_drain = loaded_move_drain
         self.standby_drain = standby_drain
@@ -482,28 +484,36 @@ class HeterogeneousWarehouse(gym.Env):
         return not (agv.carrying_shelf and shelf is not None)
 
     def shortest_path_distance(
-        self, agv_id: int, target: Tuple[int, int]
+        self,
+        agv_id: int,
+        target: Tuple[int, int],
+        include_live_agvs: bool = False,
     ) -> Optional[int]:
         """Return static-rule legal path distance for reward shaping and priors.
 
         The graph respects boundaries, pickers, standing shelves for loaded
-        AGVs, and dead AGVs. Live AGVs remain dynamic obstacles handled by the
-        action mask; including them here would make the reward non-stationary.
+        AGVs, and dead AGVs. By default, live AGVs remain dynamic obstacles
+        handled by the action mask; this keeps reward shaping free from their
+        non-stationarity. ``include_live_agvs=True`` is intended for action
+        priors that need an immediately executable route.
         """
 
-        result = self._shortest_path(agv_id, target)
+        result = self._shortest_path(agv_id, target, include_live_agvs)
         return result[0] if result is not None else None
 
     def shortest_path_next_position(
-        self, agv_id: int, target: Tuple[int, int]
+        self,
+        agv_id: int,
+        target: Tuple[int, int],
+        include_live_agvs: bool = False,
     ) -> Optional[Tuple[int, int]]:
         """Return the first legal grid cell on a shortest path to ``target``."""
 
-        result = self._shortest_path(agv_id, target)
+        result = self._shortest_path(agv_id, target, include_live_agvs)
         return result[1] if result is not None else None
 
     def _shortest_path(
-        self, agv_id: int, target: Tuple[int, int]
+        self, agv_id: int, target: Tuple[int, int], include_live_agvs: bool
     ) -> Optional[Tuple[int, Optional[Tuple[int, int]]]]:
         agv = next((item for item in self.agents if item.id == agv_id), None)
         if agv is None or agv.dead:
@@ -520,7 +530,9 @@ class HeterogeneousWarehouse(gym.Env):
         while queue:
             current = queue.popleft()
             for candidate in self._path_neighbors(current):
-                if candidate in parents or self._path_blocked(agv, candidate):
+                if candidate in parents or self._path_blocked(
+                    agv, candidate, include_live_agvs
+                ):
                     continue
                 parents[candidate] = current
                 if candidate == target:
@@ -537,7 +549,9 @@ class HeterogeneousWarehouse(gym.Env):
         x, y = position
         return ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1))
 
-    def _path_blocked(self, agv: AGV, position: Tuple[int, int]) -> bool:
+    def _path_blocked(
+        self, agv: AGV, position: Tuple[int, int], include_live_agvs: bool
+    ) -> bool:
         x, y = position
         rows, cols = self.grid_size
         if not (0 <= x < cols and 0 <= y < rows):
@@ -546,6 +560,11 @@ class HeterogeneousWarehouse(gym.Env):
             return True
         if any(
             other.dead and other is not agv and (other.x, other.y) == position
+            for other in self.agents
+        ):
+            return True
+        if include_live_agvs and any(
+            not other.dead and other is not agv and (other.x, other.y) == position
             for other in self.agents
         ):
             return True
@@ -576,6 +595,11 @@ class HeterogeneousWarehouse(gym.Env):
     def _can_toggle_load(self, agv: AGV) -> bool:
         if agv.carrying_shelf is None:
             return self._shelf_at((agv.x, agv.y)) is not None
+        if not self.allow_manual_unload:
+            # Picking removes the shelf automatically at a dock.  Letting an
+            # early curriculum policy unload anywhere else creates a trivial
+            # load/unload loop with no useful task progress.
+            return False
         if (agv.x, agv.y) in self.picking_docks:
             return False
         if (agv.x, agv.y) in self.charging_stations:

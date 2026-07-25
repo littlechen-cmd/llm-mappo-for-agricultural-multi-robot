@@ -8,6 +8,7 @@ environment:
   max_steps: 100
   max_completed_tasks: 1
   terminate_on_death: false
+  allow_manual_unload: false
 
 model:
   local_radius: 3
@@ -17,10 +18,14 @@ planner:
   plan_horizon: 20
 
 prior:
-  confidence: 0.9
+  confidence: 1.0
 
 reward:
   path_progress_scale: 0.05
+  time_penalty: 0.01
+  load_bonus: 0.25
+  picking_start_bonus: 0.25
+  unload_penalty: 0.25
 
 mappo:
   gamma: 0.99
@@ -29,9 +34,11 @@ mappo:
   actor_learning_rate: 0.0003
   critic_learning_rate: 0.0003
   value_coefficient: 0.5
-  entropy_coefficient: 0.01
-  prior_coefficient: 0.1
-  prior_mixing_coefficient: 0.8
+  # The rule teacher already provides directed exploration.  Extra entropy
+  # after the Actor becomes competent causes destructive random deviations.
+  entropy_coefficient: 0.0
+  prior_coefficient: 1.0
+  prior_mixing_coefficient: 1.0
   max_grad_norm: 0.5
   update_epochs: 4
   minibatch_size: 128
@@ -40,7 +47,17 @@ training:
   seed: 42
   episodes: 2000
   planner_interval: 20
-  prior_decay_episodes: 800
+  # Stage 1: deterministic rule demonstrations and behavioral cloning.
+  prior_warmup_episodes: 500
+  # Stage 2: withdraw behavior guidance; the remaining episodes fine-tune
+  # the Actor alone while persistent KL behavioral cloning prevents a single
+  # failed stochastic rollout from erasing the learned policy.
+  prior_decay_episodes: 900
+  prior_mixing_final: 0.0
+  prior_kl_final_coefficient: 1.0
+  actor_eval_interval: 100
+  actor_eval_episodes: 10
   log_interval: 20
   checkpoint_interval: 100
   checkpoint_path: artifacts/mappo_tiny_1ag_curriculum.pt
+  latest_checkpoint_path: artifacts/mappo_tiny_1ag_curriculum_latest.pt
