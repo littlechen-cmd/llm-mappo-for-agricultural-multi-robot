@@ -33,9 +33,9 @@ def make_rware_style_layout(
 
     RWARE's standard layout uses three-cell shelf columns separated by vertical
     highways and horizontal highways between rack rows.  This generator keeps
-    that placement rule, replaces the lower-left delivery area with a picker,
-    dock, and charger (``P.C``), and reserves the remaining lower delivery row
-    for AGV spawns.
+    that placement rule, places the picker and its dock at the lower left, and
+    reserves one rightmost charging/spawn cell (``C``) for every AGV.  AGVs
+    therefore always begin a new episode on distinct chargers.
     """
 
     if size not in WAREHOUSE_SIZES:
@@ -61,22 +61,15 @@ def make_rware_style_layout(
             if not (vertical_highway or horizontal_highway or delivery_row or queue_lane):
                 layout[y][x] = "S"
 
-    # The picker remains an occupied cell; an AGV hands off from its right-side dock.
+    # The picker remains occupied; an AGV hands off from its right-side dock.
     layout[rows - 1][0] = "P"
     layout[rows - 1][1] = "."
-    layout[rows - 1][2] = "C"
-
-    spawn_candidates = [
-        (x, rows - 1)
-        for x in range(cols - 1, -1, -1)
-        if x not in {0, 1, 2}
-    ]
-    if n_agvs > len(spawn_candidates):
+    if n_agvs > cols - 2:
         raise ValueError(
-            f"{size} supports at most {len(spawn_candidates)} AGV spawns on its service row"
+            f"{size} supports at most {cols - 2} AGV charging spawns on its service row"
         )
-    for x, y in spawn_candidates[:n_agvs]:
-        layout[y][x] = "A"
+    for x in range(cols - n_agvs, cols):
+        layout[rows - 1][x] = "C"
 
     return tuple("".join(row) for row in layout)
 
@@ -94,12 +87,13 @@ class HeterogeneousAction(Enum):
 
 @dataclass
 class HeterogeneousShelf:
-    """A shelf holds one requested item and leaves the map after picking."""
+    """A physical shelf that can receive a new cargo request after picking."""
 
     id: int
     x: int
     y: int
     active: bool = True
+    home_position: Optional[Tuple[int, int]] = None
 
 
 @dataclass
@@ -137,9 +131,9 @@ class HeterogeneousWarehouse(gym.Env):
 
     Layout symbols are ``.`` for a corridor, ``S`` for a shelf, ``P`` for a
     fixed picker/picking station, ``C`` for a charging station, and ``A`` for
-    an AGV spawn point.  The AGV docking location for each ``P`` is the cell
-    immediately to its right.  The default map therefore places the picking
-    station in the lower-left corner, as required by the project model.
+    a legacy custom-layout AGV spawn point.  In generated layouts, every AGV
+    starts on one of the rightmost ``C`` charging cells.  The AGV docking
+    location for each ``P`` is the cell immediately to its right.
 
     Every AGV observation is a float vector with the following fields:
     ``x, y, direction, battery, loaded, dead, locked, pick-progress,
@@ -171,6 +165,7 @@ class HeterogeneousWarehouse(gym.Env):
         max_completed_tasks: Optional[int] = None,
         terminate_on_death: bool = False,
         allow_manual_unload: bool = False,
+        continuous_task_generation: bool = True,
         move_drain: float = 0.01,
         loaded_move_drain: float = 0.02,
         standby_drain: float = 0.002,
@@ -207,6 +202,7 @@ class HeterogeneousWarehouse(gym.Env):
         self.max_completed_tasks = max_completed_tasks
         self.terminate_on_death = terminate_on_death
         self.allow_manual_unload = allow_manual_unload
+        self.continuous_task_generation = continuous_task_generation
         self.move_drain = move_drain
         self.loaded_move_drain = loaded_move_drain
         self.standby_drain = standby_drain
@@ -240,6 +236,7 @@ class HeterogeneousWarehouse(gym.Env):
         self.request_queue: List[HeterogeneousShelf] = []
         self._steps = 0
         self.completed_tasks = 0
+        self.generated_requests = 0
 
     def _parse_layout(self, layout: Sequence[str]) -> None:
         if not layout:
@@ -276,7 +273,8 @@ class HeterogeneousWarehouse(gym.Env):
         if not self.charging_stations:
             raise ValueError("layout must contain at least one charger (C)")
         if not self.agv_spawns:
-            raise ValueError("layout must contain at least one AGV spawn (A)")
+            # Generated layouts use rightmost chargers as AGV spawn cells.
+            self.agv_spawns = list(self.charging_stations)
 
         self.picking_docks: List[Tuple[int, int]] = []
         static_cells = set(self.picker_spawns) | set(self.charging_stations) | set(
@@ -294,8 +292,9 @@ class HeterogeneousWarehouse(gym.Env):
         super().reset(seed=seed)
         self._steps = 0
         self.completed_tasks = 0
+        self.generated_requests = 0
         self.shelfs = [
-            HeterogeneousShelf(index + 1, x, y)
+            HeterogeneousShelf(index + 1, x, y, home_position=(x, y))
             for index, (x, y) in enumerate(self.shelf_spawns)
         ]
         self.request_queue = list(self.shelfs[: self.request_queue_size])
@@ -649,12 +648,10 @@ class HeterogeneousWarehouse(gym.Env):
                 continue
             shelf = agv.carrying_shelf
             if shelf is not None:
-                shelf.active = False
-                shelf.x, shelf.y = -1, -1
                 self.completed_tasks += 1
                 if shelf in self.request_queue:
                     self.request_queue.remove(shelf)
-                self._enqueue_next_request()
+                self._enqueue_next_request(shelf, events)
                 agv.carrying_shelf = None
                 rewards[agv.id - 1] += self.pick_reward
                 events.append(
@@ -666,7 +663,28 @@ class HeterogeneousWarehouse(gym.Env):
                 )
             agv.picking_station_id = None
 
-    def _enqueue_next_request(self) -> None:
+    def _enqueue_next_request(
+        self, completed_shelf: HeterogeneousShelf, events: List[Dict[str, object]]
+    ) -> None:
+        if self.continuous_task_generation:
+            # Re-stock the completed physical shelf at its rack position.  The
+            # shelf identity stays stable while this is a distinct cargo task.
+            completed_shelf.active = True
+            completed_shelf.x, completed_shelf.y = completed_shelf.home_position
+            self.request_queue.append(completed_shelf)
+            self.generated_requests += 1
+            events.append(
+                {
+                    "type": "REQUEST_GENERATED",
+                    "shelf_id": completed_shelf.id,
+                    "position": completed_shelf.home_position,
+                    "generated_requests": self.generated_requests,
+                }
+            )
+            return
+
+        completed_shelf.active = False
+        completed_shelf.x, completed_shelf.y = -1, -1
         for shelf in self.shelfs:
             if shelf.active and shelf not in self.request_queue:
                 self.request_queue.append(shelf)
@@ -722,6 +740,7 @@ class HeterogeneousWarehouse(gym.Env):
             "events": events,
             "steps": self._steps,
             "active_requests": [shelf.id for shelf in self.request_queue],
+            "generated_requests": self.generated_requests,
             "battery": [agv.battery for agv in self.agents],
             "dead_agvs": [agv.id for agv in self.agents if agv.dead],
         }

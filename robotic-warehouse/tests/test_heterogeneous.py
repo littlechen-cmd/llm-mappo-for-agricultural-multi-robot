@@ -30,6 +30,7 @@ def test_initial_state_and_spaces(env):
 
 def test_charging_requires_a_charging_station(env):
     agv = env.agents[0]
+    agv.x, agv.y = env.picking_docks[0]
     agv.battery = 0.5
     env.step([HeterogeneousAction.CHARGE.value, HeterogeneousAction.NOOP.value])
     assert agv.battery == pytest.approx(0.5 - env.standby_drain)
@@ -63,9 +64,13 @@ def test_picking_locks_agv_for_exact_duration_and_completes_task(env):
     )
     assert agv.picking_remaining == 0
     assert agv.carrying_shelf is None
-    assert not shelf.active
+    assert shelf.active
+    assert (shelf.x, shelf.y) == shelf.home_position
+    assert shelf in env.request_queue
     assert rewards[0] == pytest.approx(env.pick_reward)
     assert any(event["type"] == "PICKING_COMPLETED" for event in info["events"])
+    assert any(event["type"] == "REQUEST_GENERATED" for event in info["events"])
+    assert len(env.request_queue) == env.request_queue_size
 
 
 def test_death_is_one_time_penalty_and_dead_agv_blocks(env):
@@ -114,8 +119,11 @@ def test_rware_style_size_layouts_reserve_service_area_and_rack_highways(size):
         (0, expected_rows - 1)
     ]
     assert env.picking_docks == [(1, expected_rows - 1)]
-    assert env.charging_stations == [(2, expected_rows - 1)]
-    assert all(agent.y == expected_rows - 1 for agent in env.agents)
+    expected_chargers = [
+        (x, expected_rows - 1) for x in range(expected_columns - env.n_agents, expected_columns)
+    ]
+    assert env.charging_stations == expected_chargers
+    assert [(agent.x, agent.y) for agent in env.agents] == expected_chargers
 
     # RWARE-style vertical and horizontal highway cells must never hold shelves.
     for shelf in env.shelfs:
@@ -125,4 +133,26 @@ def test_rware_style_size_layouts_reserve_service_area_and_rack_highways(size):
 
 def test_rware_style_layout_rejects_too_many_agvs_for_service_row():
     with pytest.raises(ValueError, match="supports at most"):
-        make_rware_style_layout("tiny", n_agvs=8)
+        make_rware_style_layout("tiny", n_agvs=9)
+
+
+def test_continuous_task_generation_keeps_n_active_requests():
+    env = HeterogeneousWarehouse(size="tiny", n_agvs=2, request_queue_size=2)
+    env.reset(seed=5)
+    completed_shelf = env.request_queue[0]
+    agv = env.agents[0]
+    agv.x, agv.y = env.picking_docks[0]
+    agv.carrying_shelf = completed_shelf
+    completed_shelf.x, completed_shelf.y = agv.x, agv.y
+
+    env.step([HeterogeneousAction.NOOP.value, HeterogeneousAction.NOOP.value])
+    env.step([HeterogeneousAction.NOOP.value, HeterogeneousAction.NOOP.value])
+    _, _, _, _, info = env.step(
+        [HeterogeneousAction.NOOP.value, HeterogeneousAction.NOOP.value]
+    )
+
+    assert len(env.request_queue) == 2
+    assert completed_shelf in env.request_queue
+    assert (completed_shelf.x, completed_shelf.y) == completed_shelf.home_position
+    assert info["generated_requests"] == 1
+    assert any(event["type"] == "REQUEST_GENERATED" for event in info["events"])
