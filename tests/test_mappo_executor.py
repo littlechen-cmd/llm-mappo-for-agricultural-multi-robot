@@ -3,7 +3,7 @@ import numpy as np
 from rware.heterogeneous import HeterogeneousWarehouse
 from rware_llm.mappo import MAPPOConfig, MAPPOExecutor
 from rware_llm.mappo.buffer import RolloutBuffer
-from rware_llm.planner import RulePlanner
+from rware_llm.planner import RuleBasedPriorPolicy, RulePlanner
 from rware_llm.state import WarehouseStateAdapter
 
 
@@ -13,7 +13,7 @@ def _make_components():
     adapter = WarehouseStateAdapter(local_radius=2)
     planner = RulePlanner(plan_horizon=5)
     decision = planner.plan(adapter.snapshot(env))
-    state = adapter.build(env, decision)
+    state = adapter.build(env, decision, RuleBasedPriorPolicy())
     executor = MAPPOExecutor(
         vector_dim=state.actor_vectors.shape[-1],
         local_channels=state.local_grids.shape[1],
@@ -31,6 +31,9 @@ def test_adapter_exposes_local_cnn_global_cnn_and_safe_actions():
     assert state.local_grids.shape == (env.n_agents, 10, 5, 5)
     assert state.global_map.shape == (10, *env.grid_size)
     assert state.action_masks.shape == (env.n_agents, env.action_space[0].n)
+    assert state.prior_action_probs.shape == (env.n_agents, env.action_space[0].n)
+    assert np.allclose(state.prior_action_probs.sum(axis=1), 1.0)
+    assert np.all(state.prior_action_probs[~state.action_masks] == 0.0)
     assert np.all(state.action_masks[:, 0])
 
 
@@ -56,8 +59,8 @@ def test_shared_actor_act_and_ppo_update_complete_on_cpu():
             break
         if env._steps % 2 == 0:
             decision = planner.plan(adapter.snapshot(env))
-        state = adapter.build(env, decision)
+        state = adapter.build(env, decision, RuleBasedPriorPolicy())
 
     metrics = executor.update(rollout, state.global_map, done)
-    assert set(metrics) == {"actor_loss", "critic_loss", "entropy"}
+    assert set(metrics) == {"actor_loss", "critic_loss", "entropy", "prior_loss"}
     assert all(np.isfinite(value) for value in metrics.values())

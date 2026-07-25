@@ -1,7 +1,7 @@
 """State encoding from heterogeneous RWARE into MAPPO network inputs."""
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -24,6 +24,7 @@ class MAPPOState:
     local_grids: np.ndarray
     global_map: np.ndarray
     action_masks: np.ndarray
+    prior_action_probs: np.ndarray
 
 
 class WarehouseStateAdapter:
@@ -74,7 +75,7 @@ class WarehouseStateAdapter:
             events=tuple(events),
         )
 
-    def build(self, env, decision: PlannerDecision) -> MAPPOState:
+    def build(self, env, decision: PlannerDecision, prior_policy=None) -> MAPPOState:
         observations = np.asarray(env.get_observations(), dtype=np.float32)
         assignments = [decision.assignment_for(agent.id) for agent in env.agents]
         conditions = np.asarray(
@@ -91,12 +92,27 @@ class WarehouseStateAdapter:
             [self._local_grid(base_map, agent, assignment, env.grid_size) for agent, assignment in zip(env.agents, assignments)],
             dtype=np.float32,
         )
+        action_masks = env.get_action_mask()
+        prior_action_probs = (
+            prior_policy.action_distribution(env, decision, action_masks)
+            if prior_policy is not None
+            else self._uniform_legal_action_probs(action_masks)
+        )
         return MAPPOState(
             actor_vectors=actor_vectors,
             local_grids=local_grids,
             global_map=global_map,
-            action_masks=env.get_action_mask(),
+            action_masks=action_masks,
+            prior_action_probs=prior_action_probs,
         )
+
+    @staticmethod
+    def _uniform_legal_action_probs(action_masks: np.ndarray) -> np.ndarray:
+        masks = np.asarray(action_masks, dtype=bool)
+        legal_counts = masks.sum(axis=1, keepdims=True)
+        if np.any(legal_counts == 0):
+            raise ValueError("every AGV must have at least one legal action")
+        return masks.astype(np.float32) / legal_counts.astype(np.float32)
 
     def _condition(
         self, agent, assignment: TaskAssignment, grid_size, decision, current_step

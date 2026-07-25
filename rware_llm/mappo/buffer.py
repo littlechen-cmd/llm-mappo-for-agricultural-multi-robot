@@ -36,6 +36,9 @@ class RolloutBuffer:
             "local_grids": np.stack([state.local_grids for state in self.states]),
             "global_maps": np.stack([state.global_map for state in self.states]),
             "action_masks": np.stack([state.action_masks for state in self.states]),
+            "prior_action_probs": np.stack(
+                [state.prior_action_probs for state in self.states]
+            ),
             "actions": np.stack(self.actions),
             "log_probs": np.stack(self.log_probs),
             "values": np.asarray(self.values, dtype=np.float32),

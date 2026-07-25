@@ -2,13 +2,12 @@ device: auto
 
 environment:
   size: tiny
-  n_agvs: 2
+  n_agvs: 1
   request_queue_size: 1
-  max_steps: 100
   picking_duration: 2
-
-reward:
-  path_progress_scale: 0.05
+  max_steps: 100
+  max_completed_tasks: 1
+  terminate_on_death: false
 
 model:
   local_radius: 3
@@ -16,6 +15,12 @@ model:
 planner:
   charge_threshold: 0.2
   plan_horizon: 20
+
+prior:
+  confidence: 0.9
+
+reward:
+  path_progress_scale: 0.05
 
 mappo:
   gamma: 0.99
@@ -28,14 +33,14 @@ mappo:
   prior_coefficient: 0.1
   prior_mixing_coefficient: 0.8
   max_grad_norm: 0.5
-  update_epochs: 2
-  minibatch_size: 64
+  update_epochs: 4
+  minibatch_size: 128
 
 training:
   seed: 42
-  episodes: 100
-  planner_interval: 10
-  prior_decay_episodes: 80
-  log_interval: 1
-  checkpoint_interval: 20
-  checkpoint_path: artifacts/mappo_tiny_2ag_200.pt
+  episodes: 2000
+  planner_interval: 20
+  prior_decay_episodes: 800
+  log_interval: 20
+  checkpoint_interval: 100
+  checkpoint_path: artifacts/mappo_tiny_1ag_curriculum.pt

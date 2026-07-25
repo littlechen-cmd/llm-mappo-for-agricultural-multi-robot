@@ -7,6 +7,7 @@ the right of a picker.  This makes the picker an occupied map cell while still
 allowing a physically unambiguous AGV-to-picker handoff.
 """
 
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -167,6 +168,7 @@ class HeterogeneousWarehouse(gym.Env):
         request_queue_size: int = 1,
         picking_duration: int = 2,
         max_steps: Optional[int] = 200,
+        max_completed_tasks: Optional[int] = None,
         terminate_on_death: bool = False,
         move_drain: float = 0.01,
         loaded_move_drain: float = 0.02,
@@ -181,6 +183,8 @@ class HeterogeneousWarehouse(gym.Env):
             raise ValueError("picking_duration must be at least one step")
         if request_queue_size < 1:
             raise ValueError("request_queue_size must be at least one")
+        if max_completed_tasks is not None and max_completed_tasks < 1:
+            raise ValueError("max_completed_tasks must be at least one when set")
         if min(move_drain, loaded_move_drain, standby_drain, charge_rate) < 0:
             raise ValueError("energy rates must be non-negative")
 
@@ -199,6 +203,7 @@ class HeterogeneousWarehouse(gym.Env):
         self.request_queue_size = request_queue_size
         self.picking_duration = picking_duration
         self.max_steps = max_steps
+        self.max_completed_tasks = max_completed_tasks
         self.terminate_on_death = terminate_on_death
         self.move_drain = move_drain
         self.loaded_move_drain = loaded_move_drain
@@ -232,6 +237,7 @@ class HeterogeneousWarehouse(gym.Env):
         self.shelfs: List[HeterogeneousShelf] = []
         self.request_queue: List[HeterogeneousShelf] = []
         self._steps = 0
+        self.completed_tasks = 0
 
     def _parse_layout(self, layout: Sequence[str]) -> None:
         if not layout:
@@ -285,6 +291,7 @@ class HeterogeneousWarehouse(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self._steps = 0
+        self.completed_tasks = 0
         self.shelfs = [
             HeterogeneousShelf(index + 1, x, y)
             for index, (x, y) in enumerate(self.shelf_spawns)
@@ -380,7 +387,22 @@ class HeterogeneousWarehouse(gym.Env):
                 agv.dir = self._turned_direction(agv.dir, action)
                 successful_actions[index] = True
             elif action == HeterogeneousAction.TOGGLE_LOAD:
+                previous_shelf = agv.carrying_shelf
                 successful_actions[index] = self._toggle_load(agv)
+                if successful_actions[index]:
+                    events.append(
+                        {
+                            "type": "SHELF_LOADED"
+                            if previous_shelf is None
+                            else "SHELF_UNLOADED",
+                            "agv_id": agv.id,
+                            "shelf_id": (
+                                agv.carrying_shelf.id
+                                if agv.carrying_shelf is not None
+                                else previous_shelf.id
+                            ),
+                        }
+                    )
             elif action == HeterogeneousAction.CHARGE:
                 if (agv.x, agv.y) in self.charging_stations:
                     agv.battery = min(1.0, agv.battery + self.charge_rate)
@@ -404,8 +426,14 @@ class HeterogeneousWarehouse(gym.Env):
 
         self._steps += 1
         tasks_complete = not any(shelf.active for shelf in self.shelfs)
+        curriculum_complete = (
+            self.max_completed_tasks is not None
+            and self.completed_tasks >= self.max_completed_tasks
+        )
         any_death = any(agv.dead for agv in self.agents)
-        terminated = tasks_complete or (self.terminate_on_death and any_death)
+        terminated = tasks_complete or curriculum_complete or (
+            self.terminate_on_death and any_death
+        )
         truncated = self.max_steps is not None and self._steps >= self.max_steps
         return (
             self._observations(),
@@ -452,6 +480,81 @@ class HeterogeneousWarehouse(gym.Env):
             return False
         shelf = self._shelf_at(target)
         return not (agv.carrying_shelf and shelf is not None)
+
+    def shortest_path_distance(
+        self, agv_id: int, target: Tuple[int, int]
+    ) -> Optional[int]:
+        """Return static-rule legal path distance for reward shaping and priors.
+
+        The graph respects boundaries, pickers, standing shelves for loaded
+        AGVs, and dead AGVs. Live AGVs remain dynamic obstacles handled by the
+        action mask; including them here would make the reward non-stationary.
+        """
+
+        result = self._shortest_path(agv_id, target)
+        return result[0] if result is not None else None
+
+    def shortest_path_next_position(
+        self, agv_id: int, target: Tuple[int, int]
+    ) -> Optional[Tuple[int, int]]:
+        """Return the first legal grid cell on a shortest path to ``target``."""
+
+        result = self._shortest_path(agv_id, target)
+        return result[1] if result is not None else None
+
+    def _shortest_path(
+        self, agv_id: int, target: Tuple[int, int]
+    ) -> Optional[Tuple[int, Optional[Tuple[int, int]]]]:
+        agv = next((item for item in self.agents if item.id == agv_id), None)
+        if agv is None or agv.dead:
+            return None
+        start = (agv.x, agv.y)
+        if start == target:
+            return 0, None
+        rows, cols = self.grid_size
+        if not (0 <= target[0] < cols and 0 <= target[1] < rows):
+            return None
+
+        queue = deque([start])
+        parents = {start: None}
+        while queue:
+            current = queue.popleft()
+            for candidate in self._path_neighbors(current):
+                if candidate in parents or self._path_blocked(agv, candidate):
+                    continue
+                parents[candidate] = current
+                if candidate == target:
+                    path = [candidate]
+                    while parents[path[-1]] is not None:
+                        path.append(parents[path[-1]])
+                    path.reverse()
+                    return len(path) - 1, path[1]
+                queue.append(candidate)
+        return None
+
+    @staticmethod
+    def _path_neighbors(position: Tuple[int, int]):
+        x, y = position
+        return ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1))
+
+    def _path_blocked(self, agv: AGV, position: Tuple[int, int]) -> bool:
+        x, y = position
+        rows, cols = self.grid_size
+        if not (0 <= x < cols and 0 <= y < rows):
+            return True
+        if position in {(picker.x, picker.y) for picker in self.picking_robots}:
+            return True
+        if any(
+            other.dead and other is not agv and (other.x, other.y) == position
+            for other in self.agents
+        ):
+            return True
+        return agv.carrying_shelf is not None and any(
+            shelf.active
+            and shelf is not agv.carrying_shelf
+            and (shelf.x, shelf.y) == position
+            for shelf in self.shelfs
+        )
 
     def _shelf_at(self, location: Tuple[int, int]) -> Optional[HeterogeneousShelf]:
         for shelf in self.shelfs:
@@ -524,12 +627,19 @@ class HeterogeneousWarehouse(gym.Env):
             if shelf is not None:
                 shelf.active = False
                 shelf.x, shelf.y = -1, -1
+                self.completed_tasks += 1
                 if shelf in self.request_queue:
                     self.request_queue.remove(shelf)
                 self._enqueue_next_request()
                 agv.carrying_shelf = None
                 rewards[agv.id - 1] += self.pick_reward
-                events.append({"type": "PICKING_COMPLETED", "agv_id": agv.id})
+                events.append(
+                    {
+                        "type": "PICKING_COMPLETED",
+                        "agv_id": agv.id,
+                        "shelf_id": shelf.id,
+                    }
+                )
             agv.picking_station_id = None
 
     def _enqueue_next_request(self) -> None:

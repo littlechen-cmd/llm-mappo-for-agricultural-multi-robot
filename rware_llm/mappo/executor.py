@@ -21,6 +21,8 @@ class MAPPOConfig:
     critic_learning_rate: float = 3.0e-4
     value_coefficient: float = 0.5
     entropy_coefficient: float = 0.01
+    prior_coefficient: float = 0.1
+    prior_mixing_coefficient: float = 0.8
     max_grad_norm: float = 0.5
     update_epochs: int = 4
     minibatch_size: int = 128
@@ -55,6 +57,14 @@ class MAPPOExecutor:
                 {"params": self.critic.parameters(), "lr": config.critic_learning_rate},
             ]
         )
+        self.prior_coefficient = config.prior_coefficient
+        self.prior_mixing_coefficient = config.prior_mixing_coefficient
+
+    def set_prior_strength(self, mixing_coefficient: float, coefficient: float) -> None:
+        """Set current curriculum values used for sampling and PPO updates."""
+
+        self.prior_mixing_coefficient = max(0.0, float(mixing_coefficient))
+        self.prior_coefficient = max(0.0, float(coefficient))
 
     @torch.no_grad()
     def act(self, state, deterministic: bool = False) -> ActionOutput:
@@ -62,7 +72,10 @@ class MAPPOExecutor:
         local_grids = self._tensor(state.local_grids, torch.float32)
         masks = self._tensor(state.action_masks, torch.bool)
         global_map = self._tensor(state.global_map[None, ...], torch.float32)
-        logits = self.actor(vectors, local_grids, masks)
+        actor_logits = self.actor(vectors, local_grids, masks)
+        logits = self._behavior_logits(
+            actor_logits, self._tensor(state.prior_action_probs, torch.float32)
+        )
         distribution = Categorical(logits=logits)
         actions = torch.argmax(logits, dim=-1) if deterministic else distribution.sample()
         return ActionOutput(
@@ -87,7 +100,12 @@ class MAPPOExecutor:
             advantages_tensor.std(unbiased=False) + 1.0e-8
         )
 
-        metrics = {"actor_loss": 0.0, "critic_loss": 0.0, "entropy": 0.0}
+        metrics = {
+            "actor_loss": 0.0,
+            "critic_loss": 0.0,
+            "entropy": 0.0,
+            "prior_loss": 0.0,
+        }
         update_count = 0
         for _ in range(self.config.update_epochs):
             permutation = torch.randperm(sample_count, device=self.device)
@@ -100,11 +118,13 @@ class MAPPOExecutor:
         return {key: value / max(update_count, 1) for key, value in metrics.items()}
 
     def _update_minibatch(self, samples, indices):
-        logits = self.actor(
+        actor_logits = self.actor(
             samples["actor_vectors"][indices],
             samples["local_grids"][indices],
             samples["action_masks"][indices],
         )
+        prior_probs = samples["prior_action_probs"][indices]
+        logits = self._behavior_logits(actor_logits, prior_probs)
         distribution = Categorical(logits=logits)
         log_probs = distribution.log_prob(samples["actions"][indices])
         ratio = torch.exp(log_probs - samples["old_log_probs"][indices])
@@ -117,10 +137,16 @@ class MAPPOExecutor:
         entropy = distribution.entropy().mean()
         values = self.critic(samples["global_maps"][indices])
         critic_loss = nn.functional.mse_loss(values, samples["returns"][indices])
+        prior_loss = nn.functional.kl_div(
+            torch.log_softmax(actor_logits, dim=-1),
+            prior_probs,
+            reduction="batchmean",
+        )
         loss = (
             actor_loss
             + self.config.value_coefficient * critic_loss
             - self.config.entropy_coefficient * entropy
+            + self.prior_coefficient * prior_loss
         )
         self.optimizer.zero_grad()
         loss.backward()
@@ -133,6 +159,7 @@ class MAPPOExecutor:
             "actor_loss": float(actor_loss.detach().item()),
             "critic_loss": float(critic_loss.detach().item()),
             "entropy": float(entropy.detach().item()),
+            "prior_loss": float(prior_loss.detach().item()),
         }
 
     def _gae(self, rewards, values, dones, last_value, last_done):
@@ -158,6 +185,9 @@ class MAPPOExecutor:
             "local_grids": self._tensor(flatten_agent_axis(arrays["local_grids"]), torch.float32),
             "global_maps": self._tensor(global_maps, torch.float32),
             "action_masks": self._tensor(flatten_agent_axis(arrays["action_masks"]), torch.bool),
+            "prior_action_probs": self._tensor(
+                flatten_agent_axis(arrays["prior_action_probs"]), torch.float32
+            ),
             "actions": self._tensor(arrays["actions"].reshape(-1), torch.long),
             "old_log_probs": self._tensor(arrays["log_probs"].reshape(-1), torch.float32),
             "advantages": self._tensor(np.repeat(advantages, agents), torch.float32),
@@ -170,7 +200,29 @@ class MAPPOExecutor:
             "critic": self.critic.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "config": asdict(self.config),
+            "prior_strength": {
+                "mixing_coefficient": self.prior_mixing_coefficient,
+                "coefficient": self.prior_coefficient,
+            },
         }
+
+    def load_state_dict(self, state_dict):
+        self.actor.load_state_dict(state_dict["actor"])
+        self.critic.load_state_dict(state_dict["critic"])
+        if "optimizer" in state_dict:
+            self.optimizer.load_state_dict(state_dict["optimizer"])
+        prior_strength = state_dict.get("prior_strength", {})
+        self.set_prior_strength(
+            prior_strength.get("mixing_coefficient", self.config.prior_mixing_coefficient),
+            prior_strength.get("coefficient", self.config.prior_coefficient),
+        )
+
+    def _behavior_logits(self, actor_logits, prior_probs):
+        if self.prior_mixing_coefficient <= 0.0:
+            return actor_logits
+        return actor_logits + self.prior_mixing_coefficient * torch.log(
+            prior_probs.clamp_min(1.0e-8)
+        )
 
     def _tensor(self, value, dtype):
         return torch.as_tensor(value, dtype=dtype, device=self.device)
