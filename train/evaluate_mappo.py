@@ -65,6 +65,7 @@ def make_env(env_config, render_mode=None):
         max_steps=env_config["max_steps"],
         max_completed_tasks=env_config.get("max_completed_tasks"),
         terminate_on_death=env_config.get("terminate_on_death", False),
+        allow_manual_unload=env_config.get("allow_manual_unload", False),
         render_mode=render_mode,
     )
 

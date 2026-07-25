@@ -73,11 +73,11 @@ class MAPPOExecutor:
         masks = self._tensor(state.action_masks, torch.bool)
         global_map = self._tensor(state.global_map[None, ...], torch.float32)
         actor_logits = self.actor(vectors, local_grids, masks)
-        logits = self._behavior_logits(
+        probs = self._behavior_probs(
             actor_logits, self._tensor(state.prior_action_probs, torch.float32)
         )
-        distribution = Categorical(logits=logits)
-        actions = torch.argmax(logits, dim=-1) if deterministic else distribution.sample()
+        distribution = Categorical(probs=probs)
+        actions = torch.argmax(probs, dim=-1) if deterministic else distribution.sample()
         return ActionOutput(
             actions=actions.cpu().numpy(),
             log_probs=distribution.log_prob(actions).cpu().numpy(),
@@ -124,8 +124,7 @@ class MAPPOExecutor:
             samples["action_masks"][indices],
         )
         prior_probs = samples["prior_action_probs"][indices]
-        logits = self._behavior_logits(actor_logits, prior_probs)
-        distribution = Categorical(logits=logits)
+        distribution = Categorical(probs=self._behavior_probs(actor_logits, prior_probs))
         log_probs = distribution.log_prob(samples["actions"][indices])
         ratio = torch.exp(log_probs - samples["old_log_probs"][indices])
         advantages = samples["advantages"][indices]
@@ -217,12 +216,21 @@ class MAPPOExecutor:
             prior_strength.get("coefficient", self.config.prior_coefficient),
         )
 
-    def _behavior_logits(self, actor_logits, prior_probs):
-        if self.prior_mixing_coefficient <= 0.0:
-            return actor_logits
-        return actor_logits + self.prior_mixing_coefficient * torch.log(
-            prior_probs.clamp_min(1.0e-8)
-        )
+    def _behavior_probs(self, actor_logits, prior_probs):
+        """Return a convex actor/prior mixture for rollout and PPO ratios.
+
+        Adding log prior probabilities to actor logits does not make a mixture:
+        an arbitrary actor logit can still override a high-confidence rule.  A
+        probability-space mixture gives the curriculum coefficient its intended
+        meaning and ensures a strong prior really controls early rollouts.
+        """
+
+        actor_probs = torch.softmax(actor_logits, dim=-1)
+        mixing = self.prior_mixing_coefficient
+        if mixing <= 0.0:
+            return actor_probs
+        probs = (1.0 - mixing) * actor_probs + mixing * prior_probs
+        return probs / probs.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
 
     def _tensor(self, value, dtype):
         return torch.as_tensor(value, dtype=dtype, device=self.device)

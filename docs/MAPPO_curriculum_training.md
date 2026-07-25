@@ -1,5 +1,20 @@
 # MAPPO Tiny-1AG Curriculum
 
+## Continuous Warehouse Environment
+
+Generated RWARE-style maps place the fixed picker and its dock at the lower
+left. Charging and spawning are co-located in the rightmost cells of the
+service row: an environment with `n_agvs` has exactly `n_agvs` consecutive
+chargers, and every AGV begins on one of them.
+
+`request_queue_size` is the concurrent cargo-request count `n`. After each
+`PICKING_COMPLETED`, the completed physical shelf is restocked at its original
+rack position and immediately re-enters the request queue. The environment
+therefore keeps `n` active cargo transport requests until an episode's
+`max_completed_tasks` or `max_steps` limit ends it. This changes the initial
+state and task stream, so Actor checkpoints trained on the former layout must
+be retrained before Actor-only acceptance on this environment.
+
 ## Scope
 
 `configs/mappo_tiny_1ag_curriculum.yaml` is the first curriculum stage. It
@@ -54,6 +69,15 @@ Actor-only success rate and native return; `latest_checkpoint_path` stores the
 last optimizer state for diagnosis.
 
 ## Evaluation and Visualization
+
+For a deterministic, Actor-only tiny-2ag live demonstration with a per-step
+planner/action/event trace, use `train/demo_tiny_2ag.py`. The script does not
+use rule-prior behavior mixing, so it is suitable for demonstrating the model
+that passed Actor-only evaluation.
+
+```powershell
+python train\demo_tiny_2ag.py --config configs\mappo_tiny_2ag_stage1.yaml --checkpoint artifacts\mappo_tiny_2ag_stage1.pt --device cpu --delay 0.25 --keep-open
+```
 
 Actor-only evaluation measures the learned low-level policy:
 

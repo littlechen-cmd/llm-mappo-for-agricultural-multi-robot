@@ -60,7 +60,11 @@ class RuleBasedPriorPolicy:
     def _navigate(self, env, agv, target: Optional[Tuple[int, int]]) -> int:
         if target is None:
             return HeterogeneousAction.NOOP.value
-        next_position = env.shortest_path_next_position(agv.id, target)
+        # Unlike reward shaping, action selection must avoid live AGVs that
+        # would make its immediate FORWARD action illegal.
+        next_position = env.shortest_path_next_position(
+            agv.id, target, include_live_agvs=True
+        )
         if next_position is None:
             return HeterogeneousAction.NOOP.value
         desired = self._direction_to((agv.x, agv.y), next_position)
