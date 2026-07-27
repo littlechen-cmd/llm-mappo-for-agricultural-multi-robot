@@ -33,6 +33,7 @@ class ActionOutput:
     actions: np.ndarray
     log_probs: np.ndarray
     value: float
+    entropy: float
 
 
 class MAPPOExecutor:
@@ -82,6 +83,7 @@ class MAPPOExecutor:
             actions=actions.cpu().numpy(),
             log_probs=distribution.log_prob(actions).cpu().numpy(),
             value=float(self.critic(global_map).item()),
+            entropy=float(distribution.entropy().mean().item()),
         )
 
     @torch.no_grad()
