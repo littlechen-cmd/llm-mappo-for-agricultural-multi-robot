@@ -1,0 +1,16 @@
+# Install a CUDA-enabled PyTorch wheel first. See README.md for the matching
+# PyTorch index URL and verification command for an RTX 4080.
+torch>=2.1,<2.7
+
+# Core numerical, simulation, and configuration dependencies.
+numpy>=1.24,<3
+gymnasium>=0.29,<1.1
+networkx>=3.0,<4
+PyYAML>=6.0,<7
+pyglet>=1.5,<2
+six>=1.16,<2
+
+# Training diagnostics, visualization, and deterministic regression tests.
+tensorboard>=2.14,<3
+Pillow>=10.0,<12
+pytest>=7.0,<9
