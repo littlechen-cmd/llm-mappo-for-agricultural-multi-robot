@@ -21,6 +21,9 @@ class LegalPathRewardShaper:
     load_bonus: float = 0.25
     picking_start_bonus: float = 0.25
     unload_penalty: float = 0.25
+    safe_charge: float = 5.0
+    safe_charge_streak_steps: int = 0
+    safe_charge_reward: float = 0.0
     _plan_id: Optional[str] = field(default=None, init=False)
     _distances: Dict[int, Optional[int]] = field(default_factory=dict, init=False)
     _targets: Dict[int, Optional[Tuple[int, int]]] = field(default_factory=dict, init=False)

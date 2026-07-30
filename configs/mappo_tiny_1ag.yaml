@@ -17,7 +17,7 @@ model:
   local_radius: 3
 
 planner:
-  charge_threshold: 0.2
+  charge_threshold: 2.0
   reserve_margin: 0.1
   plan_horizon: 20
 

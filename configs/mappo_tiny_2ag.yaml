@@ -17,7 +17,7 @@ model:
   local_radius: 3
 
 planner:
-  charge_threshold: 0.2
+  charge_threshold: 2.0
   reserve_margin: 0.1
   plan_horizon: 20
 
@@ -61,11 +61,11 @@ training:
   actor_eval_episodes: 20
   log_interval: 20
   checkpoint_interval: 100
-  checkpoint_path: artifacts/mappo_tiny_2ag_v2.pt
-  latest_checkpoint_path: artifacts/mappo_tiny_2ag_v2_latest.pt
+  checkpoint_path: artifacts/mappo_tiny_2ag_recovery.pt
+  latest_checkpoint_path: artifacts/mappo_tiny_2ag_recovery_latest.pt
 
 tensorboard:
   enabled: true
-  log_dir: runs/mappo_tiny_2ag_v2
+  log_dir: runs/mappo_tiny_2ag_recovery
   flush_secs: 15
   flush_interval: 20

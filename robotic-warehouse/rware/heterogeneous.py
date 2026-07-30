@@ -27,14 +27,18 @@ WAREHOUSE_SIZES = {
 
 
 def make_rware_style_layout(
-    size: str, n_agvs: int, column_height: int = 8
+    size: str,
+    n_agvs: int,
+    n_pickers: int = 1,
+    n_chargers: Optional[int] = None,
+    column_height: int = 8,
 ) -> Tuple[str, ...]:
     """Build a RWARE-style rack layout with heterogeneous service stations.
 
     RWARE's standard layout uses three-cell shelf columns separated by vertical
     highways and horizontal highways between rack rows.  This generator keeps
-    that placement rule, places the picker and its dock at the lower left, and
-    reserves one rightmost charging/spawn cell (``C``) for every AGV.  AGVs
+    that placement rule, places up to four picker/dock pairs in the left-side
+    service area, and reserves rightmost charging/spawn cells (``C``).  AGVs
     therefore always begin a new episode on distinct chargers.
     """
 
@@ -43,6 +47,12 @@ def make_rware_style_layout(
         raise ValueError(f"unknown warehouse size '{size}'; use one of {supported}")
     if n_agvs < 1:
         raise ValueError("n_agvs must be at least one")
+    if n_pickers not in {1, 2, 4}:
+        raise ValueError("n_pickers must be one of 1, 2, or 4")
+    if n_chargers is None:
+        n_chargers = n_agvs
+    if n_chargers != n_agvs:
+        raise ValueError("generated layouts require n_chargers to equal n_agvs")
     if column_height < 1:
         raise ValueError("column_height must be at least one")
 
@@ -61,14 +71,23 @@ def make_rware_style_layout(
             if not (vertical_highway or horizontal_highway or delivery_row or queue_lane):
                 layout[y][x] = "S"
 
-    # The picker remains occupied; an AGV hands off from its right-side dock.
-    layout[rows - 1][0] = "P"
-    layout[rows - 1][1] = "."
-    if n_agvs > cols - 2:
+    # Picker cells stay occupied; AGVs hand off from the adjacent right-side
+    # docks. The two service rows preserve the existing rack/highway layout.
+    picker_positions = (
+        (0, rows - 1),
+        (3, rows - 1),
+        (0, rows - 2),
+        (3, rows - 2),
+    )
+    for x, y in picker_positions[:n_pickers]:
+        layout[y][x] = "P"
+        layout[y][x + 1] = "."
+
+    if n_chargers > cols - 5:
         raise ValueError(
-            f"{size} supports at most {cols - 2} AGV charging spawns on its service row"
+            f"{size} supports at most {cols - 5} AGV charging spawns with four pickers"
         )
-    for x in range(cols - n_agvs, cols):
+    for x in range(cols - n_chargers, cols):
         layout[rows - 1][x] = "C"
 
     return tuple("".join(row) for row in layout)
@@ -104,7 +123,7 @@ class AGV:
     x: int
     y: int
     dir: Direction
-    battery: float = 1.0
+    battery: float = 10.0
     carrying_shelf: Optional[HeterogeneousShelf] = None
     dead: bool = False
     death_penalty_applied: bool = False
@@ -158,6 +177,8 @@ class HeterogeneousWarehouse(gym.Env):
         layout: Optional[Sequence[str]] = None,
         size: Optional[str] = None,
         n_agvs: Optional[int] = None,
+        n_pickers: int = 1,
+        n_chargers: Optional[int] = None,
         column_height: int = 8,
         request_queue_size: int = 1,
         picking_duration: int = 2,
@@ -166,9 +187,14 @@ class HeterogeneousWarehouse(gym.Env):
         terminate_on_death: bool = False,
         allow_manual_unload: bool = False,
         continuous_task_generation: bool = True,
-        move_drain: float = 0.01,
-        loaded_move_drain: float = 0.02,
-        standby_drain: float = 0.002,
+        randomize_initial_requests: bool = False,
+        initial_battery: float = 10.0,
+        max_battery: float = 10.0,
+        safe_charge: float = 5.0,
+        move_drain: float = 0.001,
+        loaded_move_drain: float = 0.002,
+        toggle_load_drain: float = 0.002,
+        standby_drain: float = 0.0002,
         charge_rate: float = 0.2,
         pick_reward: float = 1.0,
         death_penalty: float = -10.0,
@@ -181,13 +207,29 @@ class HeterogeneousWarehouse(gym.Env):
             raise ValueError("request_queue_size must be at least one")
         if max_completed_tasks is not None and max_completed_tasks < 1:
             raise ValueError("max_completed_tasks must be at least one when set")
-        if min(move_drain, loaded_move_drain, standby_drain, charge_rate) < 0:
+        if max_battery <= 0:
+            raise ValueError("max_battery must be positive")
+        if not 0 <= initial_battery <= max_battery:
+            raise ValueError("initial_battery must be within [0, max_battery]")
+        if not 0 <= safe_charge <= max_battery:
+            raise ValueError("safe_charge must be within [0, max_battery]")
+        if min(
+            move_drain,
+            loaded_move_drain,
+            toggle_load_drain,
+            standby_drain,
+            charge_rate,
+        ) < 0:
             raise ValueError("energy rates must be non-negative")
 
         if layout is None:
             self.size = size or "tiny"
             self.layout = make_rware_style_layout(
-                self.size, n_agvs if n_agvs is not None else 2, column_height
+                self.size,
+                n_agvs if n_agvs is not None else 2,
+                n_pickers=n_pickers,
+                n_chargers=n_chargers,
+                column_height=column_height,
             )
         else:
             self.size = "custom"
@@ -203,8 +245,13 @@ class HeterogeneousWarehouse(gym.Env):
         self.terminate_on_death = terminate_on_death
         self.allow_manual_unload = allow_manual_unload
         self.continuous_task_generation = continuous_task_generation
+        self.randomize_initial_requests = randomize_initial_requests
+        self.initial_battery = initial_battery
+        self.max_battery = max_battery
+        self.safe_charge = safe_charge
         self.move_drain = move_drain
         self.loaded_move_drain = loaded_move_drain
+        self.toggle_load_drain = toggle_load_drain
         self.standby_drain = standby_drain
         self.charge_rate = charge_rate
         self.pick_reward = pick_reward
@@ -297,13 +344,19 @@ class HeterogeneousWarehouse(gym.Env):
             HeterogeneousShelf(index + 1, x, y, home_position=(x, y))
             for index, (x, y) in enumerate(self.shelf_spawns)
         ]
-        self.request_queue = list(self.shelfs[: self.request_queue_size])
+        if self.randomize_initial_requests:
+            selected_indices = self.np_random.choice(
+                len(self.shelfs), size=self.request_queue_size, replace=False
+            )
+            self.request_queue = [self.shelfs[int(index)] for index in selected_indices]
+        else:
+            self.request_queue = list(self.shelfs[: self.request_queue_size])
         self.picking_robots = [
             PickingRobot(index + 1, x, y)
             for index, (x, y) in enumerate(self.picker_spawns)
         ]
         self.agents = [
-            AGV(index + 1, x, y, Direction.LEFT)
+            AGV(index + 1, x, y, Direction.LEFT, battery=self.initial_battery)
             for index, (x, y) in enumerate(self.agv_spawns)
         ]
         return self._observations(), self._get_info(events=[])
@@ -406,9 +459,14 @@ class HeterogeneousWarehouse(gym.Env):
                     )
             elif action == HeterogeneousAction.CHARGE:
                 if (agv.x, agv.y) in self.charging_stations:
-                    agv.battery = min(1.0, agv.battery + self.charge_rate)
+                    previous_battery = agv.battery
+                    agv.battery = min(self.max_battery, agv.battery + self.charge_rate)
                     successful_actions[index] = True
                     events.append({"type": "CHARGED", "agv_id": agv.id})
+                    if previous_battery < self.safe_charge <= agv.battery:
+                        events.append(
+                            {"type": "BATTERY_SAFETY_CROSSED", "agv_id": agv.id}
+                        )
 
         self._advance_picking(rewards, events)
         self._start_available_picking(events)
@@ -629,10 +687,11 @@ class HeterogeneousWarehouse(gym.Env):
             agv.picking_remaining = self.picking_duration
             occupied_stations.add(station_id)
             events.append(
-                {
-                    "type": "PICKING_STARTED",
-                    "agv_id": agv.id,
-                    "station_id": station_id + 1,
+                    {
+                        "type": "PICKING_STARTED",
+                        "agv_id": agv.id,
+                        "shelf_id": agv.carrying_shelf.id,
+                        "station_id": station_id + 1,
                     "duration": self.picking_duration,
                 }
             )
@@ -695,11 +754,12 @@ class HeterogeneousWarehouse(gym.Env):
     ) -> float:
         if agv.locked or not successful or action == HeterogeneousAction.NOOP:
             return self.standby_drain
+        if action == HeterogeneousAction.TOGGLE_LOAD:
+            return self.toggle_load_drain
         if action in (
             HeterogeneousAction.FORWARD,
             HeterogeneousAction.LEFT,
             HeterogeneousAction.RIGHT,
-            HeterogeneousAction.TOGGLE_LOAD,
         ):
             return self.loaded_move_drain if agv.carrying_shelf else self.move_drain
         return self.standby_drain
@@ -719,7 +779,7 @@ class HeterogeneousWarehouse(gym.Env):
                 agv.x / max(cols - 1, 1),
                 agv.y / max(rows - 1, 1),
                 direction,
-                agv.battery,
+                agv.battery / self.max_battery,
                 float(agv.carrying_shelf is not None),
                 float(agv.dead),
                 float(agv.locked),

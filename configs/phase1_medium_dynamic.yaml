@@ -1,0 +1,22 @@
+environment:
+  size: medium
+  n_agvs: 3
+  n_pickers: 2
+  n_chargers: 3
+  request_queue_size: 1
+  picking_duration: 2
+  max_steps: 400
+  max_completed_tasks: 12
+  continuous_task_generation: false
+  randomize_initial_requests: true
+  initial_battery: 10.0
+  max_battery: 10.0
+  safe_charge: 5.0
+
+dynamic_tasks:
+  rate_per_step: 0.05
+  max_pending_requests: 3
+  train_seed_start: 1000
+  train_seed_count: 100
+  heldout_seed_start: 2000
+  heldout_seed_count: 20

@@ -18,14 +18,27 @@ def _distance(first: Tuple[int, int], second: Tuple[int, int]) -> int:
 class RulePlanner(HighLevelPlanner):
     """Battery-aware nearest-request planner with the future LLM interface."""
 
-    def __init__(self, charge_threshold: float = 0.2, plan_horizon: int = 20):
+    def __init__(
+        self,
+        charge_threshold: float = 2.0,
+        reserve_margin: float = 0.0,
+        plan_horizon: int = 20,
+    ):
         self.charge_threshold = charge_threshold
+        self.reserve_margin = reserve_margin
         self.plan_horizon = plan_horizon
         self._next_plan_index = 1
 
     def plan(self, snapshot: PlannerSnapshot) -> PlannerDecision:
         requested = [shelf for shelf in snapshot.shelves if shelf.requested]
-        reserved_shelves: Set[int] = set()
+        # A shelf being carried is already committed to that AGV.  Treating it
+        # as available lets another AGV receive an unreachable collection task
+        # and can block the loaded AGV's only route to the picking dock.
+        reserved_shelves: Set[int] = {
+            agent.carrying_shelf_id
+            for agent in snapshot.agents
+            if agent.carrying_shelf_id is not None
+        }
         assignments: Dict[int, TaskAssignment] = {}
 
         for agent in sorted(snapshot.agents, key=lambda item: item.id):
