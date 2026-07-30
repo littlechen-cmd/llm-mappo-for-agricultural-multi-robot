@@ -26,6 +26,7 @@ class MAPPOConfig:
     max_grad_norm: float = 0.5
     update_epochs: int = 4
     minibatch_size: int = 128
+    diagnostic_metrics: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,7 @@ class MAPPOExecutor:
         samples = self._flatten_samples(arrays, advantages, returns)
         sample_count = samples["actions"].shape[0]
         advantages_tensor = samples["advantages"]
+        value_predictions = samples["returns"] - advantages_tensor
         samples["advantages"] = (advantages_tensor - advantages_tensor.mean()) / (
             advantages_tensor.std(unbiased=False) + 1.0e-8
         )
@@ -108,6 +110,15 @@ class MAPPOExecutor:
             "entropy": 0.0,
             "prior_loss": 0.0,
         }
+        if self.config.diagnostic_metrics:
+            metrics.update(
+                {
+                    "policy_ratio": 0.0,
+                    "approx_kl": 0.0,
+                    "clip_fraction": 0.0,
+                    "grad_norm": 0.0,
+                }
+            )
         update_count = 0
         for _ in range(self.config.update_epochs):
             permutation = torch.randperm(sample_count, device=self.device)
@@ -117,7 +128,21 @@ class MAPPOExecutor:
                 for key, value in metric.items():
                     metrics[key] += value
                 update_count += 1
-        return {key: value / max(update_count, 1) for key, value in metrics.items()}
+        metrics = {
+            key: value / max(update_count, 1) for key, value in metrics.items()
+        }
+        returns_tensor = samples["returns"]
+        values_tensor = value_predictions
+        return_variance = torch.var(returns_tensor, unbiased=False)
+        if self.config.diagnostic_metrics:
+            metrics["explained_variance"] = float(
+                (
+                    1.0
+                    - torch.var(returns_tensor - values_tensor, unbiased=False)
+                    / (return_variance + 1.0e-8)
+                ).item()
+            )
+        return metrics
 
     def _update_minibatch(self, samples, indices):
         actor_logits = self.actor(
@@ -151,17 +176,35 @@ class MAPPOExecutor:
         )
         self.optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(
+        grad_norm = nn.utils.clip_grad_norm_(
             list(self.actor.parameters()) + list(self.critic.parameters()),
             self.config.max_grad_norm,
         )
         self.optimizer.step()
-        return {
+        metrics = {
             "actor_loss": float(actor_loss.detach().item()),
             "critic_loss": float(critic_loss.detach().item()),
             "entropy": float(entropy.detach().item()),
             "prior_loss": float(prior_loss.detach().item()),
         }
+        if self.config.diagnostic_metrics:
+            metrics.update(
+                {
+            "policy_ratio": float(ratio.detach().mean().item()),
+            "approx_kl": float(
+                (samples["old_log_probs"][indices] - log_probs).detach().mean().item()
+            ),
+            "clip_fraction": float(
+                (torch.abs(ratio - 1.0) > self.config.clip_ratio)
+                .detach()
+                .float()
+                .mean()
+                .item()
+            ),
+            "grad_norm": float(grad_norm.detach().item()),
+                }
+            )
+        return metrics
 
     def _gae(self, rewards, values, dones, last_value, last_done):
         advantages = np.zeros_like(rewards, dtype=np.float32)

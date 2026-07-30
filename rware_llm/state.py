@@ -33,13 +33,18 @@ class WarehouseStateAdapter:
     local_channels = 10
     global_channels = 10
 
-    def __init__(self, local_radius: int = 3):
+    def __init__(self, local_radius: int = 3, include_phase2_features: bool = False):
         self.local_radius = local_radius
         self.local_size = 2 * local_radius + 1
+        self.include_phase2_features = include_phase2_features
 
     @property
     def condition_size(self) -> int:
-        return len(TASK_ORDER) + 4
+        base_size = len(TASK_ORDER) + 4
+        # Three nearest neighbors with five relative attributes plus task
+        # urgency and local congestion. This Phase 2 extension is opt-in so
+        # existing Tiny/Small checkpoint shapes remain load-compatible.
+        return base_size + 17 if self.include_phase2_features else base_size
 
     def snapshot(self, env, events=()) -> PlannerSnapshot:
         requested_ids = {shelf.id for shelf in env.request_queue}
@@ -80,7 +85,7 @@ class WarehouseStateAdapter:
         assignments = [decision.assignment_for(agent.id) for agent in env.agents]
         conditions = np.asarray(
             [
-                self._condition(agent, assignment, env.grid_size, decision, env._steps)
+                self._condition(agent, assignment, env, decision, env._steps)
                 for agent, assignment in zip(env.agents, assignments)
             ],
             dtype=np.float32,
@@ -115,9 +120,9 @@ class WarehouseStateAdapter:
         return masks.astype(np.float32) / legal_counts.astype(np.float32)
 
     def _condition(
-        self, agent, assignment: TaskAssignment, grid_size, decision, current_step
+        self, agent, assignment: TaskAssignment, env, decision, current_step
     ) -> np.ndarray:
-        rows, cols = grid_size
+        rows, cols = env.grid_size
         task_one_hot = np.zeros(len(TASK_ORDER), dtype=np.float32)
         task_one_hot[TASK_ORDER.index(assignment.task_type)] = 1.0
         if assignment.target is None:
@@ -126,7 +131,7 @@ class WarehouseStateAdapter:
             target_dx = (assignment.target[0] - agent.x) / max(cols - 1, 1)
             target_dy = (assignment.target[1] - agent.y) / max(rows - 1, 1)
         remaining = max(decision.valid_until_step - current_step, 0)
-        return np.concatenate(
+        base_condition = np.concatenate(
             (
                 task_one_hot,
                 np.asarray(
@@ -139,6 +144,48 @@ class WarehouseStateAdapter:
                     dtype=np.float32,
                 ),
             )
+        )
+        if not self.include_phase2_features:
+            return base_condition
+        return np.concatenate(
+            (base_condition, self._phase2_features(agent, assignment, env))
+        )
+
+    def _phase2_features(self, agent, assignment: TaskAssignment, env) -> np.ndarray:
+        """Encode fixed-width nearby-AGV and local execution context features."""
+
+        rows, cols = env.grid_size
+        scale_x = max(cols - 1, 1)
+        scale_y = max(rows - 1, 1)
+        neighbors = sorted(
+            (other for other in env.agents if other.id != agent.id),
+            key=lambda other: (
+                abs(other.x - agent.x) + abs(other.y - agent.y),
+                other.id,
+            ),
+        )[:3]
+        relative_states = []
+        for other in neighbors:
+            relative_states.extend(
+                (
+                    (other.x - agent.x) / scale_x,
+                    (other.y - agent.y) / scale_y,
+                    other.battery / max(env.max_battery, 1.0),
+                    float(other.carrying_shelf is not None),
+                    other.dir.value / max(len(type(other.dir)) - 1, 1),
+                )
+            )
+        relative_states.extend([0.0] * (15 - len(relative_states)))
+        nearby_live_agvs = sum(
+            not other.dead
+            and abs(other.x - agent.x) + abs(other.y - agent.y) <= self.local_radius
+            for other in env.agents
+            if other.id != agent.id
+        )
+        congestion = nearby_live_agvs / max(min(len(env.agents) - 1, 3), 1)
+        return np.asarray(
+            (*relative_states, np.clip(assignment.priority, 0.0, 1.0), congestion),
+            dtype=np.float32,
         )
 
     def _base_global_map(self, env) -> np.ndarray:
